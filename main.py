@@ -7,6 +7,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.layers import LSTM
+import matplotlib.pyplot as plt
+import os
 
 
 class RNNModel:
@@ -73,13 +75,38 @@ class RNNModel:
     def train_model(self):
         """Entrena el model"""
         self.model = Sequential()
-        self.model.add(LSTM(64, input_shape=(self.X_train_transformed.shape[1], 1), activation='relu'))
-        self.model.add(Dense(32, activation='relu'))
+        self.model.add(
+            LSTM(64, input_shape=(self.X_train_transformed.shape[1], 1), activation='relu', return_sequences=True))
+        self.model.add(LSTM(64, activation='relu', return_sequences=True))
+        self.model.add(LSTM(32, activation='relu'))
+        self.model.add(Dense(64, activation='relu'))
         self.model.add(Dense(len(self.num_features), activation='linear'))
         self.model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
 
-        self.model.fit(self.X_train_transformed.reshape(-1, self.X_train_transformed.shape[1], 1), self.y_train,
-                       epochs=100, verbose=1)
+        # Crear un directorio para guardar los gráficos
+        if not os.path.exists('graficos'):
+            os.makedirs('graficos')
+
+        for epoch in range(200):
+            print(f"Epoch: {epoch + 1}")
+            self.model.fit(self.X_train_transformed.reshape(-1, self.X_train_transformed.shape[1], 1), self.y_train,
+                           epochs=1, verbose=1)
+
+            # Realizar predicciones en el conjunto de prueba
+            predictions = self.model.predict(self.X_test_transformed.reshape(-1, self.X_test_transformed.shape[1], 1))
+
+            # Crear gráfico comparando los datos reales
+            fig, ax = plt.subplots(len(self.num_features), 1, figsize=(12, len(self.num_features) * 4))
+
+            for idx, feature in enumerate(self.num_features):
+                ax[idx].plot(self.y_test.index, self.y_test[feature], label='Real')
+                ax[idx].plot(self.y_test.index, predictions[:, idx], label='Predicción', linestyle='--')
+                ax[idx].set_title(f"{feature} - Epoch {epoch + 1}")
+                ax[idx].legend()
+
+            # Guardar el gráfico en un archivo
+            fig.savefig(f"graficos/grafico_epoch_{epoch + 1}.png")
+            plt.close(fig)
 
     def adjust_data(self):
         """Ajusta les dades"""
