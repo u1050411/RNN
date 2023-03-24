@@ -1,131 +1,137 @@
 import pandas as pd
 import numpy as np
-import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import SimpleRNN, Dense
-from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.layers import Dense
+from sklearn.preprocessing import OneHotEncoder
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error
-import datetime
-import os
+from sklearn.compose import ColumnTransformer
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.layers import LSTM
 
 
 class RNNModel:
-    def __init__(self, sequence_length=30, n_units=50):
-        self.sequence_length = sequence_length
-        self.n_units = n_units
-        self.scaler = MinMaxScaler()
-        self.model = None
+    def __init__(self, input_file):
+        self.input_file = input_file
 
+    def read_data(self):
+        """Llegeix l'arxiu CSV"""
+        self.data = pd.read_csv(self.input_file, sep=";", parse_dates=[0])
 
-    def preprocess_data(self, df):
-        category_col = "Grup monitoritzacio"
-        numeric_cols = df.columns[1:]
-        df_numeric = df[numeric_cols]  # Create a separate DataFrame for numeric columns
-        self.scaler.fit(df_numeric)
-        df_numeric = self.scaler.transform(df_numeric)
+    def remove_nan(self):
+        """Elimina les files amb valors NaN"""
+        self.data = self.data.dropna()
 
-        df = pd.concat([df[[category_col]], pd.DataFrame(df_numeric, columns=numeric_cols, index=df.index)], axis=1)
-        df = pd.get_dummies(df, columns=[category_col])
+    def set_columns(self):
+        """Defineix la columna de data, categòrica i numèriques"""
+        self.date_col = self.data.columns[0]
+        self.cat_feature = self.data.columns[1]
+        self.num_features = [col for col in self.data.columns[2:]]
 
-        n_features = df.shape[1]
-        X, y = [], []
+    def split_data(self):
+        """Divideix les dades en entrenament i prova"""
+        X = self.data[[f"{self.date_col}_year", f"{self.date_col}_month", f"{self.date_col}_day", self.cat_feature]]
+        y = self.data[self.num_features]
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-        for i in range(self.sequence_length, len(df)):
-            X.append(df.iloc[i - self.sequence_length:i].values)
-            y.append(df.iloc[i].values)
+    def extract_date_features(self, data, date_col):
+        """Extrae características numéricas de las fechas."""
+        data[date_col + '_year'] = data[date_col].dt.year
+        data[date_col + '_month'] = data[date_col].dt.month
+        data[date_col + '_day'] = data[date_col].dt.day
+        data = data.drop(date_col, axis=1)
+        return data
 
-        X, y = np.array(X), np.array(y)
-        return X, y, n_features
+    def preprocess_data(self):
+        """Preprocessament de les dades"""
+        self.preprocessor = ColumnTransformer(transformers=[
+            ('cat', OneHotEncoder(handle_unknown='ignore'), [3]),
+            ('num', 'passthrough', [0, 1, 2])
+        ], remainder='drop')
 
-    def inverse_transform(self, data, original_columns):
-        data_numeric = self.scaler.inverse_transform(data[:, :len(original_columns) - 1])
-        data_combined = np.concatenate([data_numeric, data[:, len(original_columns) - 1:]], axis=1)
-        return data_combined
+        self.X_train_transformed = self.preprocessor.fit_transform(self.X_train)
+        self.X_test_transformed = self.preprocessor.transform(self.X_test)
 
-
-    def build(self, input_shape):
+    def train_model(self):
+        """Entrena el model"""
         self.model = Sequential()
-        self.model.add(SimpleRNN(units=self.n_units, activation="relu", input_shape=input_shape))
-        self.model.add(Dense(units=input_shape[1]))
-        self.model.compile(optimizer="adam", loss="mean_squared_error")
+        self.model.add(LSTM(64, input_shape=(self.X_train_transformed.shape[1], 1), activation='relu'))
+        self.model.add(Dense(32, activation='relu'))
+        self.model.add(Dense(len(self.num_features), activation='linear'))
+        self.model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
 
-    def train(self, X_train, y_train, epochs=100, batch_size=32):
-        self.model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size)
+        self.model.fit(self.X_train_transformed.reshape(-1, self.X_train_transformed.shape[1], 1), self.y_train,
+                       epochs=100, verbose=1)
 
-    def predict(self, X):
-        return self.model.predict(X)
+    def adjust_data(self):
+        """Ajusta les dades"""
+        # Extraer características numéricas de las fechas
+        self.data = self.extract_date_features(self.data, self.date_col)
 
-    @staticmethod
-    def save_forecast_to_excel(forecast_df, output_file):
-        """
-        Guarda un dataframe de pronóstico en un archivo Excel.
-        Si el archivo de salida ya existe, lo sobrescribe.
-        """
-        if os.path.isfile(output_file):
-            os.remove(output_file)
-            print(f"'{output_file}' fue eliminado para ser sobrescrito")
+        # Divideix les dades en entrenament i prova
+        X = self.data[[f"{self.date_col}_year", f"{self.date_col}_month", f"{self.date_col}_day", self.cat_feature]]
+        y = self.data[self.num_features]
 
-        forecast_df.to_excel(output_file)
-        print(f"Pronóstico guardado en '{output_file}'")
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    def main(self):
-        # Load data
-        file_path = ".\\dades\\ICS LLE IQ foto diaria - Dades Brut.csv"
-        df = pd.read_csv(file_path, delimiter=";", parse_dates=["Data Tall"], dayfirst=True)
-        df = df.dropna()
-        df.set_index("Data Tall", inplace=True)
+        # Preprocessament de les dades
+        self.preprocessor = ColumnTransformer(transformers=[
+            ('cat', OneHotEncoder(handle_unknown='ignore'), [3]),
+            ('num', 'passthrough', [0, 1, 2])
+        ], remainder='drop')
+        self.X_train_transformed = self.preprocessor.fit_transform(self.X_train)
+        self.X_test_transformed = self.preprocessor.transform(self.X_test)
 
-        rnn = RNNModel(sequence_length=30, n_units=50)
+        # Guardar las categorías únicas para futuras predicciones
+        self.unique_categories = sorted(self.data[self.cat_feature].unique())
 
-        # Preprocess data
-        X, y, n_features = rnn.preprocess_data(df)
+    def generate_future_data(self):
+        """Genera dades futures"""
+        # Genera la data per al 1 d'abril de 2023
+        future_date = pd.to_datetime('2023-04-01')
 
-        # Train-test split
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+        # Crea un DataFrame buit per a emmagatzemar les combinacions de data i categoria
+        self.future_data = pd.DataFrame(columns=[f"{self.date_col}_year", f"{self.date_col}_month", f"{self.date_col}_day", self.cat_feature] + self.num_features)
 
-        # Build and train RNN model
-        input_shape = (rnn.sequence_length, n_features)
-        rnn.build(input_shape)
-        rnn.train(X_train, y_train, epochs=2, batch_size=32)
+        # Genera totes les combinacions possibles de data i categoria
+        for category in self.unique_categories:
+            new_row = pd.DataFrame({f"{self.date_col}_year": [future_date.year], f"{self.date_col}_month": [future_date.month], f"{self.date_col}_day": [future_date.day], self.cat_feature: [category],
+                                    **{feat: [np.nan] for feat in self.num_features}})
+            self.future_data = pd.concat([self.future_data, new_row], ignore_index=True)
 
-        # Predict data
-        y_pred = rnn.predict(X_test)
-        y_pred_inv = rnn.inverse_transform(y_pred, df.columns)
-        y_test_inv = rnn.inverse_transform(y_test, df.columns)
+    def predict_future_data(self):
+        """Preveure dades futures"""
+        # Extraer características numéricas de las fechas
+        self.future_data = self.extract_date_features(self.future_data, self.date_col)
 
-        # Calculate performance using Mean Squared Error
-        mse = mean_squared_error(y_test_inv, y_pred_inv)
+        # Usa las columnas extraídas de la fecha y la columna categórica
+        self.future_data_transformed = self.preprocessor.transform(self.future_data[[f"{self.date_col}_year",
+                                                                                     f"{self.date_col}_month",
+                                                                                     f"{self.date_col}_day",
+                                                                                     self.cat_feature]])
+        # Convierte los datos de entrada a float32
+        self.future_data_transformed = self.future_data_transformed.astype(np.float32)
 
-        # Forecast data for 2023
-        last_known_data = X[-1].reshape(1, rnn.sequence_length, n_features)
-        forecasted_data = rnn.predict(last_known_data)
-        forecasted_data_inv = rnn.inverse_transform(forecasted_data, df.columns)
+        self.future_predictions = self.model.predict(self.future_data_transformed.reshape(-1, self.future_data_transformed.shape[1], 1))
 
-        # Create a DataFrame with the forecasted data
-        forecast_date = df.index[-1] + datetime.timedelta(days=1)
-        modified_columns = pd.get_dummies(df.reset_index(), columns=['Grup monitoritzacio']).columns[
-                           1:]  # Get the modified columns after creating dummy columns
-        forecast_df = pd.DataFrame(forecasted_data_inv, columns=modified_columns, index=[forecast_date])
-
-        print("\nForecast for", forecast_date.strftime("%Y-%m-%d"))
-
-        rnn.save_forecast_to_excel(forecast_df, "foto_diaria_2023.xlsx")
-
-    @staticmethod
-    def save_forecast_to_excel(forecast_df, output_file):
-        """
-        Guarda un dataframe de pronóstico en un archivo Excel.
-        Si el archivo de salida ya existe, lo sobrescribe.
-        """
-        if os.path.isfile(output_file):
-            os.remove(output_file)
-            print(f"'{output_file}' fue eliminado para ser sobrescrito")
-
-        forecast_df.to_excel(output_file)
-        print(f"Pronóstico guardado en '{output_file}'")
+        # Guarda les prediccions en un arxiu Excel
+        self.save_predictions()
 
 
-if __name__ == "__main__":
-    predictorDT = RNNModel()
-    predictorDT.main()
+    def save_predictions(self):
+        """Guarda les prediccions en un arxiu Excel"""
+        output_file = "prediccions_RNNModel_2023.xlsx"
+        self.future_data[self.num_features] = self.future_predictions
+        self.future_data.to_excel(output_file, engine='openpyxl', index=False)
+
+
+if __name__ == '__main__':
+    predictor = RNNModel(input_file=".\\dades\\Dades_Grups.csv")
+    predictor.read_data()
+    predictor.remove_nan()
+    predictor.set_columns()
+    predictor.adjust_data()
+    predictor.split_data()
+    predictor.preprocess_data()
+    predictor.train_model()
+    predictor.generate_future_data()
+    predictor.predict_future_data()
