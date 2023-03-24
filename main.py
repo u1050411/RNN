@@ -90,13 +90,15 @@ class RNNModel:
         future_date = pd.to_datetime('2023-04-01')
 
         # Crea un DataFrame buit per a emmagatzemar les combinacions de data i categoria
-        self.future_data = pd.DataFrame(columns=[f"{self.date_col}_year", f"{self.date_col}_month", f"{self.date_col}_day", self.cat_feature] + self.num_features)
+        self.future_data = pd.DataFrame(columns=[self.date_col, self.cat_feature] + self.num_features)
 
         # Genera totes les combinacions possibles de data i categoria
         for category in self.unique_categories:
-            new_row = pd.DataFrame({f"{self.date_col}_year": [future_date.year], f"{self.date_col}_month": [future_date.month], f"{self.date_col}_day": [future_date.day], self.cat_feature: [category],
+            new_row = pd.DataFrame({self.date_col: [future_date],
+                                    self.cat_feature: [category],
                                     **{feat: [np.nan] for feat in self.num_features}})
             self.future_data = pd.concat([self.future_data, new_row], ignore_index=True)
+
 
     def predict_future_data(self):
         """Preveure dades futures"""
