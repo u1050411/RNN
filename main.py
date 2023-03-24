@@ -31,7 +31,26 @@ class RNNModel:
         """Divideix les dades en entrenament i prova"""
         X = self.data[[f"{self.date_col}_year", f"{self.date_col}_month", f"{self.date_col}_day", self.cat_feature]]
         y = self.data[self.num_features]
-        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        # Reconstruir la columna de fecha original
+        reconstructed_date = pd.to_datetime(
+            X[[f"{self.date_col}_year", f"{self.date_col}_month", f"{self.date_col}_day"]].rename(columns={
+                f"{self.date_col}_year": "year",
+                f"{self.date_col}_month": "month",
+                f"{self.date_col}_day": "day"
+            }))
+
+        # Establecer la fecha de corte en el 1 de enero de 2023
+        cutoff_date = pd.to_datetime('2023-01-01')
+
+        # Separar los datos en entrenamiento y prueba según la fecha de corte
+        train_mask = reconstructed_date < cutoff_date
+        test_mask = reconstructed_date >= cutoff_date
+
+        self.X_train = X[train_mask]
+        self.X_test = X[test_mask]
+        self.y_train = y[train_mask]
+        self.y_test = y[test_mask]
 
     def extract_date_features(self, data, date_col):
         """Extrae características numéricas de las fechas."""
