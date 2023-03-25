@@ -12,6 +12,7 @@ import os
 import optuna
 from tensorflow.keras.callbacks import EarlyStopping
 from datetime import datetime
+from tensorflow.keras import backend as K
 from sklearn.metrics import mean_squared_error
 
 
@@ -76,6 +77,10 @@ class RNNModel:
         self.X_train_transformed = self.preprocessor.fit_transform(self.X_train)
         self.X_test_transformed = self.preprocessor.transform(self.X_test)
 
+    def weighted_mse(self, y_true, y_pred):
+        weights = np.array([1.0] * 6 + [0.2] * (len(self.num_features) - 6))
+        return K.mean(K.square(y_true - y_pred) * K.constant(weights), axis=-1)
+
     def create_model(self, trial=None, params=None):
         if trial is not None:
             n_layers = trial.suggest_int("n_layers", 1, 3)
@@ -97,14 +102,15 @@ class RNNModel:
             else:
                 model.add(LSTM(num_units, activation='relu'))
 
-        model.add(Dense(len(self.num_features)))
+        model.add(Dense(len(self.num_features))) # Tiene en cuenta todas las columnas
+
 
         if trial is not None:
             lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
         else:
             lr = params["lr"]
 
-        model.compile(optimizer=Adam(learning_rate=lr), loss='mse')
+        model.compile(optimizer=Adam(learning_rate=lr), loss=self.weighted_mse)
         return model
 
     def objective(self, trial):
@@ -211,6 +217,7 @@ class RNNModel:
                               inplace=True)
 
         # Guarda las primeras 6 columnas de características numéricas
+        # Esto haria que escribiera todas las columnas de predicciones en el archivo de salida
         num_features_to_save = len(self.num_features)
         for i in range(num_features_to_save):
             self.future_data[self.num_features[i]] = self.future_predictions[:, i]
@@ -225,9 +232,9 @@ class RNNModel:
 
     def plot_comparison(self):
         y_pred = self.model.predict(self.X_test_transformed.reshape(-1, self.X_test_transformed.shape[1], 1))
-        n_plots = len(self.num_features)
-
-        for i in range(n_plots):
+        n_plots = len(self.num_features) # numero de columnes
+        # Grafic de solament 6 variables
+        for i in range(6):
             plt.figure()
             plt.plot(self.y_test.reset_index(drop=True).iloc[:, i], label="Real", linestyle='-')
             plt.plot(y_pred[:, i], label="Predicció", linestyle='--')
@@ -241,7 +248,7 @@ class RNNModel:
 
 
 if __name__ == '__main__':
-    predictor = RNNModel(input_file=".\\dades\\Dades_Grups.csv")
+    predictor = RNNModel(input_file=".\\dades\\Dades_Grups_2.csv")
     predictor.read_data()
     predictor.remove_nan()
     predictor.set_columns()
