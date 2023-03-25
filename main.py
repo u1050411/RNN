@@ -13,7 +13,11 @@ import optuna
 from tensorflow.keras.callbacks import EarlyStopping
 from datetime import datetime
 from tensorflow.keras import backend as K
+from tensorflow.keras.layers import Bidirectional
 from sklearn.metrics import mean_squared_error
+from tensorflow.keras.layers import Dropout, BatchNormalization
+#import schedule
+import time
 
 
 class RNNModel:
@@ -79,11 +83,13 @@ class RNNModel:
 
     def weighted_mse(self, y_true, y_pred):
         weights = np.array([1.0] * 6 + [0.2] * (len(self.num_features) - 6))
+        y_true = K.cast(y_true, 'float32')
+        y_pred = K.cast(y_pred, 'float32')
         return K.mean(K.square(y_true - y_pred) * K.constant(weights), axis=-1)
 
     def create_model(self, trial=None, params=None):
         if trial is not None:
-            n_layers = trial.suggest_int("n_layers", 1, 3)
+            n_layers = trial.suggest_int("n_layers", 10, 50)
         else:
             n_layers = params["n_layers"]
 
@@ -95,15 +101,19 @@ class RNNModel:
                 num_units = params[f"num_units_layer_{i + 1}"]
 
             if i == 0:
-                model.add(LSTM(num_units, activation='relu', input_shape=(self.X_train_transformed.shape[1], 1),
-                               return_sequences=True if n_layers > 1 else False))
-            elif i < n_layers - 1:
-                model.add(LSTM(num_units, activation='relu', return_sequences=True))
-            else:
+                model.add(Bidirectional(
+                    LSTM(num_units, activation='relu', input_shape=(self.X_train_transformed.shape[1], 1),
+                         return_sequences=True)))
+                model.add(Bidirectional(LSTM(num_units, activation='relu', return_sequences=True)))
+            elif i == n_layers - 1:
                 model.add(LSTM(num_units, activation='relu'))
+            else:
+                model.add(LSTM(num_units, activation='relu', return_sequences=True))
 
-        model.add(Dense(len(self.num_features))) # Tiene en cuenta todas las columnas
+            model.add(Dropout(rate=0.5))
+            model.add(BatchNormalization())
 
+        model.add(Dense(len(self.num_features)))
 
         if trial is not None:
             lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
@@ -116,10 +126,11 @@ class RNNModel:
     def objective(self, trial):
         model = self.create_model(trial)
         early_stop = EarlyStopping(monitor='val_loss', patience=5)
+        epochs = trial.suggest_int("epochs", 10, 50)
         history = model.fit(
             self.X_train_transformed.reshape(-1, self.X_train_transformed.shape[1], 1),
             self.y_train,
-            epochs=100,
+            epochs=epochs,
             verbose=1,
             validation_data=(self.X_test_transformed.reshape(-1, self.X_test_transformed.shape[1], 1), self.y_test),
             callbacks=[early_stop],
@@ -127,15 +138,16 @@ class RNNModel:
         return history.history["val_loss"][-1]
 
     def train_model(self):
+        """Entrena el model"""
         study = optuna.create_study(direction="minimize")
-        study.optimize(self.objective, n_trials=2)
+        study.optimize(self.objective, n_trials=1)
 
         self.best_params = study.best_params
         self.model = self.create_model(params=self.best_params)
         self.model.fit(
             self.X_train_transformed.reshape(-1, self.X_train_transformed.shape[1], 1),
             self.y_train,
-            epochs=100,
+            epochs=self.best_params["epochs"],
             verbose=1
         )
 
