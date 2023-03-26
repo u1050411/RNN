@@ -16,6 +16,12 @@ from tensorflow.keras import backend as K
 from tensorflow.keras.layers import Bidirectional
 from sklearn.metrics import mean_squared_error
 from tensorflow.keras.layers import Dropout, BatchNormalization
+import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import TimeSeriesSplit
+
+
 #import schedule
 import time
 
@@ -52,7 +58,7 @@ class RNNModel:
             }))
 
         # Establecer la fecha de corte en el 1 de enero de 2023
-        cutoff_date = pd.to_datetime('2023-01-01')
+        cutoff_date = pd.to_datetime('2022-01-01')
 
         # Separar los datos en entrenamiento y prueba según la fecha de corte
         train_mask = reconstructed_date < cutoff_date
@@ -89,20 +95,20 @@ class RNNModel:
 
     def create_model(self, trial=None, params=None):
         if trial is not None:
-            n_layers = trial.suggest_int("n_layers", 10, 50)
+            n_layers = trial.suggest_int("n_layers", 20, 50)
         else:
             n_layers = params["n_layers"]
 
         model = Sequential()
         for i in range(n_layers):
             if trial is not None:
-                num_units = trial.suggest_int(f"num_units_layer_{i + 1}", 10, 100)
+                num_units = trial.suggest_int(f"num_units_layer_{i + 1}", 50,100)
             else:
                 num_units = params[f"num_units_layer_{i + 1}"]
 
             if i == 0:
                 model.add(Bidirectional(
-                    LSTM(num_units, activation='relu', input_shape=(self.X_train_transformed.shape[1], 1),
+                    LSTM(num_units, activation='tanh', input_shape=(self.X_train_transformed.shape[1], 1),
                          return_sequences=True)))
                 model.add(Bidirectional(LSTM(num_units, activation='relu', return_sequences=True)))
             elif i == n_layers - 1:
@@ -126,7 +132,7 @@ class RNNModel:
     def objective(self, trial):
         model = self.create_model(trial)
         early_stop = EarlyStopping(monitor='val_loss', patience=5)
-        epochs = trial.suggest_int("epochs", 10, 50)
+        epochs = trial.suggest_int("epochs", 10, 1000)
         history = model.fit(
             self.X_train_transformed.reshape(-1, self.X_train_transformed.shape[1], 1),
             self.y_train,
@@ -161,6 +167,11 @@ class RNNModel:
         y = self.data[self.num_features]
 
         self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        # Normaliza las columnas numéricas
+        self.scaler = StandardScaler()
+        self.y_train[self.num_features] = self.scaler.fit_transform(self.y_train[self.num_features])
+        self.y_test[self.num_features] = self.scaler.transform(self.y_test[self.num_features])
 
         # Preprocessament de les dades
         self.preprocessor = ColumnTransformer(transformers=[
@@ -202,7 +213,12 @@ class RNNModel:
         # Convierte los datos de entrada a float32
         self.future_data_transformed = self.future_data_transformed.astype(np.float32)
 
-        self.future_predictions = self.model.predict(self.future_data_transformed.reshape(-1, self.future_data_transformed.shape[1], 1))
+        # Realizar predicciones
+        self.future_predictions = self.model.predict(
+            self.future_data_transformed.reshape(-1, self.future_data_transformed.shape[1], 1))
+
+        # Aplicar la transformación inversa a las predicciones futuras
+        self.future_predictions = self.scaler.inverse_transform(self.future_predictions)
 
         # Guarda les prediccions en un arxiu Excel
         self.save_predictions()
@@ -238,6 +254,11 @@ class RNNModel:
         columns_order = [self.date_col, self.cat_feature] + self.num_features[:num_features_to_save]
         self.future_data = self.future_data[columns_order]
 
+        # Agregar información sobre epochs, capas y neuronas
+        info = f"Epochs: {self.epochs}, Capas: {len(self.model.layers)}, Neuronas: {self.model.layers[0].units}"
+
+        print(info)
+
         # Guardar el DataFrame en un archivo Excel
         self.future_data.to_excel(output_file, engine='openpyxl', index=False)
 
@@ -257,10 +278,18 @@ class RNNModel:
             current_time = datetime.now().strftime("%d-%m-%Y_%H-%M")
             plt.savefig(f".\\GRAFIC\\grafic_{self.num_features[i]}_{current_time}.png")
 
+    def configure_cpu_usage(self, percentage):
+        total_cpu_cores = os.cpu_count()
+        cores_to_use = int(total_cpu_cores * percentage)
+
+        tf.config.threading.set_inter_op_parallelism_threads(cores_to_use)
+        tf.config.threading.set_intra_op_parallelism_threads(cores_to_use)
+
 
 
 if __name__ == '__main__':
-    predictor = RNNModel(input_file=".\\dades\\Dades_Grups_2.csv")
+    predictor = RNNModel(input_file=".\\dades\\Dades_Grups.csv")
+    predictor.configure_cpu_usage(0.9)
     predictor.read_data()
     predictor.remove_nan()
     predictor.set_columns()
