@@ -1,24 +1,31 @@
-import pandas as pd
-import numpy as np
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.model_selection import train_test_split
-from sklearn.compose import ColumnTransformer
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.layers import LSTM
-import matplotlib.pyplot as plt
-import os
-import optuna
-from tensorflow.keras.callbacks import EarlyStopping
 from datetime import datetime
+import matplotlib.pyplot as plt
+import numpy as np
+import optuna
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
 from tensorflow.keras import backend as K
-from sklearn.metrics import mean_squared_error
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.layers import LSTM
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.optimizers import Adam
 
 
 class RNNModel:
     def __init__(self, input_file):
         self.input_file = input_file
+        # Define el diccionario de rangos de hiperparámetros
+        self.hyperparameter_ranges = {
+            "n_layers": (10, 30),
+            "num_units_layer": (10, 100),
+            "lr": (1e-5, 1e-2),
+            "n_epochs": (10, 200),
+            "weights": (0.1, 1.0),
+            "dropout_rate": (0.0, 0.5),
+            "recurrent_dropout_rate": (0.0, 0.5)
+        }
 
     def read_data(self):
         """Llegeix l'arxiu CSV"""
@@ -34,10 +41,19 @@ class RNNModel:
         self.cat_feature = self.data.columns[1]
         self.num_features = [col for col in self.data.columns[2:]]
 
+    # Preparar les dades per el entrenament i la validació
     def split_data(self):
-        """Divideix les dades en entrenament i prova"""
+        """Prepara los datos para el entrenamiento y la evaluación"""
+
+        # Extraer características numéricas de las fechas
+        self.data = self.extract_date_features(self.data, self.date_col)
+
+        # Divide los datos en entrenamiento y prueba
         X = self.data[[f"{self.date_col}_year", f"{self.date_col}_month", f"{self.date_col}_day", self.cat_feature]]
         y = self.data[self.num_features]
+
+        # Establecer la fecha de corte en el 1 de enero de 2023
+        cutoff_date = pd.to_datetime('2023-01-01')
 
         # Reconstruir la columna de fecha original
         reconstructed_date = pd.to_datetime(
@@ -47,9 +63,6 @@ class RNNModel:
                 f"{self.date_col}_day": "day"
             }))
 
-        # Establecer la fecha de corte en el 1 de enero de 2023
-        cutoff_date = pd.to_datetime('2023-01-01')
-
         # Separar los datos en entrenamiento y prueba según la fecha de corte
         train_mask = reconstructed_date < cutoff_date
         test_mask = reconstructed_date >= cutoff_date
@@ -58,6 +71,48 @@ class RNNModel:
         self.X_test = X[test_mask]
         self.y_train = y[train_mask]
         self.y_test = y[test_mask]
+
+        # Preprocesamiento de los datos
+        self.preprocessor = ColumnTransformer(transformers=[
+            ('cat', OneHotEncoder(handle_unknown='ignore'), [3]),
+            ('num', 'passthrough', [0, 1, 2])
+        ], remainder='drop')
+        self.X_train_transformed = self.preprocessor.fit_transform(self.X_train)
+        self.X_test_transformed = self.preprocessor.transform(self.X_test)
+
+        # Guardar las categorías únicas para futuras predicciones
+        self.unique_categories = sorted(self.data[self.cat_feature].unique())
+
+    def train_model(self, n_trials=None, pretrained_model=None):
+        if pretrained_model is not None:
+            self.load_pretrained_model(pretrained_model)
+        else:
+            study = optuna.create_study(direction="minimize")
+            study.optimize(self.objective, n_trials=n_trials)
+
+            best_params = study.best_params
+            self.model = self.create_model(params=best_params)
+
+        # Extraiga los mejores pesos de los parámetros
+        best_weights = [best_params[f"weight_{i + 1}"] for i in range(len(self.num_features))]
+        self.model.compile(optimizer=Adam(learning_rate=best_params["lr"]),
+                           loss=lambda y_true, y_pred: self.weighted_mse(y_true, y_pred, best_weights))
+
+        early_stop = EarlyStopping(monitor='val_loss', patience=5)
+        history = self.model.fit(
+            self.X_train_transformed.reshape(-1, self.X_train_transformed.shape[1], 1),
+            self.y_train,
+            epochs=best_params["n_epochs"],
+            batch_size=75,
+            verbose=0,
+            validation_data=(self.X_test_transformed.reshape(-1, self.X_test_transformed.shape[1], 1), self.y_test),
+            callbacks=[early_stop],
+        )
+
+        # Guardar el mejor modelo en la carpeta './model'
+        current_time = datetime.now().strftime("%d-%m-%Y_%H-%M")
+        model_file = f"./model/best_model_{current_time}.h5"
+        self.model.save(model_file)
 
     def extract_date_features(self, data, date_col):
         """Extrae características numéricas de las fechas."""
@@ -77,95 +132,82 @@ class RNNModel:
         self.X_train_transformed = self.preprocessor.fit_transform(self.X_train)
         self.X_test_transformed = self.preprocessor.transform(self.X_test)
 
-    def weighted_mse(self, y_true, y_pred):
-        weights = np.array([1.0] * 6 + [0.2] * (len(self.num_features) - 6))
+    def weighted_mse(self, y_true, y_pred, weights):
+        y_true = K.cast(y_true, 'float32')
+        y_pred = K.cast(y_pred, 'float32')
         return K.mean(K.square(y_true - y_pred) * K.constant(weights), axis=-1)
+
+    def objective(self, trial):
+        try:
+            model = self.create_model(trial)
+
+            # Usa los rangos definidos en el diccionario de hiperparámetros
+            n_epochs = trial.suggest_int("n_epochs", *self.hyperparameter_ranges["n_epochs"])
+
+            # Sugiere un conjunto de pesos para las columnas numéricas
+            weights = [trial.suggest_float(f"weight_{i + 1}", *self.hyperparameter_ranges["weights"]) for i in range(len(self.num_features))]
+
+            # Modificar la función de pérdida para utilizar los pesos
+            model.compile(optimizer=model.optimizer, loss=lambda y_true, y_pred: self.weighted_mse(y_true, y_pred, weights))
+
+            early_stop = EarlyStopping(monitor='val_loss', patience=5)
+            history = model.fit(
+                self.X_train_transformed.reshape(-1, self.X_train_transformed.shape[1], 1),
+                self.y_train,
+                epochs=n_epochs,
+                verbose=0,
+                batch_size=75,
+                validation_data=(self.X_test_transformed.reshape(-1, self.X_test_transformed.shape[1], 1), self.y_test),
+                callbacks=[early_stop],
+            )
+        except Exception as e:
+            print(f"Ocurrió un error durante el entrenamiento: {e}")
+            return float('inf')  # Retorna un valor de pérdida alto para que este intento no sea considerado como el mejor.
+        return history.history["val_loss"][-1]
 
     def create_model(self, trial=None, params=None):
         if trial is not None:
-            n_layers = trial.suggest_int("n_layers", 10, 50)
+            n_layers = trial.suggest_int("n_layers", *self.hyperparameter_ranges["n_layers"])
         else:
             n_layers = params["n_layers"]
+
+        if trial is not None:
+            dropout_rate = trial.suggest_float("dropout_rate", *self.hyperparameter_ranges["dropout_rate"])
+            recurrent_dropout_rate = trial.suggest_float("recurrent_dropout_rate",
+                                                         *self.hyperparameter_ranges["recurrent_dropout_rate"])
+        else:
+            dropout_rate = params["dropout_rate"]
+            recurrent_dropout_rate = params["recurrent_dropout_rate"]
 
         model = Sequential()
         for i in range(n_layers):
             if trial is not None:
-                num_units = trial.suggest_int(f"num_units_layer_{i + 1}", 10, 100)
+                num_units = trial.suggest_int(f"num_units_layer_{i + 1}",
+                                              *self.hyperparameter_ranges["num_units_layer"])
             else:
                 num_units = params[f"num_units_layer_{i + 1}"]
 
             if i == 0:
                 model.add(LSTM(num_units, activation='relu', input_shape=(self.X_train_transformed.shape[1], 1),
-                               return_sequences=True if n_layers > 1 else False))
-            elif i < n_layers - 2:
-                model.add(LSTM(num_units, activation='relu', return_sequences=True))
-            elif i == n_layers - 2:
-                model.add(LSTM(num_units, activation='relu', return_sequences=True))
-                model.add(GRU(num_units, activation='relu', return_sequences=True))
+                               return_sequences=True if n_layers > 1 else False, dropout=dropout_rate,
+                               recurrent_dropout=recurrent_dropout_rate))
+            elif i < n_layers - 1:
+                model.add(LSTM(num_units, activation='relu', return_sequences=True, dropout=dropout_rate,
+                               recurrent_dropout=recurrent_dropout_rate))
             else:
-                model.add(LSTM(num_units, activation='relu'))
-                model.add(GRU(num_units, activation='relu'))
-
+                model.add(
+                    LSTM(num_units, activation='relu', dropout=dropout_rate, recurrent_dropout=recurrent_dropout_rate))
         model.add(Dense(len(self.num_features)))
-        model.add(Dense(len(self.num_features))) # Tiene en cuenta todas las columnas
-
+        model.add(Dense(len(self.num_features)))
 
         if trial is not None:
-            lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
+            lr = trial.suggest_float("lr", *self.hyperparameter_ranges["lr"], log=True)
         else:
             lr = params["lr"]
 
         model.compile(optimizer=Adam(learning_rate=lr), loss='mse')
         model.compile(optimizer=Adam(learning_rate=lr), loss=self.weighted_mse)
         return model
-
-    def objective(self, trial):
-        model = self.create_model(trial)
-        early_stop = EarlyStopping(monitor='val_loss', patience=5)
-        history = model.fit(
-            self.X_train_transformed.reshape(-1, self.X_train_transformed.shape[1], 1),
-            self.y_train,
-            epochs=100,
-            verbose=1,
-            validation_data=(self.X_test_transformed.reshape(-1, self.X_test_transformed.shape[1], 1), self.y_test),
-            callbacks=[early_stop],
-        )
-        return history.history["val_loss"][-1]
-
-    def train_model(self):
-        study = optuna.create_study(direction="minimize")
-        study.optimize(self.objective, n_trials=200)
-
-        self.best_params = study.best_params
-        self.model = self.create_model(params=self.best_params)
-        self.model.fit(
-            self.X_train_transformed.reshape(-1, self.X_train_transformed.shape[1], 1),
-            self.y_train,
-            epochs=100,
-            verbose=1
-        )
-
-    def adjust_data(self):
-        """Ajusta les dades"""
-        # Extraer características numéricas de las fechas
-        self.data = self.extract_date_features(self.data, self.date_col)
-
-        # Divideix les dades en entrenament i prova
-        X = self.data[[f"{self.date_col}_year", f"{self.date_col}_month", f"{self.date_col}_day", self.cat_feature]]
-        y = self.data[self.num_features]
-
-        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-        # Preprocessament de les dades
-        self.preprocessor = ColumnTransformer(transformers=[
-            ('cat', OneHotEncoder(handle_unknown='ignore'), [3]),
-            ('num', 'passthrough', [0, 1, 2])
-        ], remainder='drop')
-        self.X_train_transformed = self.preprocessor.fit_transform(self.X_train)
-        self.X_test_transformed = self.preprocessor.transform(self.X_test)
-
-        # Guardar las categorías únicas para futuras predicciones
-        self.unique_categories = sorted(self.data[self.cat_feature].unique())
 
     def generate_future_data(self):
         """Genera dades futures"""
@@ -183,6 +225,7 @@ class RNNModel:
                                         **{feat: [np.nan] for feat in self.num_features}})
                 self.future_data = pd.concat([self.future_data, new_row], ignore_index=True)
 
+
     def predict_future_data(self):
         """Preveure dades futures"""
         # Extraer características numéricas de las fechas
@@ -196,10 +239,12 @@ class RNNModel:
         # Convierte los datos de entrada a float32
         self.future_data_transformed = self.future_data_transformed.astype(np.float32)
 
-        self.future_predictions = self.model.predict(self.future_data_transformed.reshape(-1, self.future_data_transformed.shape[1], 1))
+        self.future_predictions = self.model.predict(
+            self.future_data_transformed.reshape(-1, self.future_data_transformed.shape[1], 1))
 
         # Guarda les prediccions en un arxiu Excel
         self.save_predictions()
+
 
     def save_predictions(self):
         """Guarda les prediccions en un arxiu Excel"""
@@ -252,17 +297,14 @@ class RNNModel:
             plt.savefig(f".\\GRAFIC\\grafic_{self.num_features[i]}_{current_time}.png")
 
 
-
 if __name__ == '__main__':
-    predictor = RNNModel(input_file=".\\dades\\Dades_Grups.csv")
+    predictor = RNNModel(input_file=".\\dades\\Dades_Grups_5.csv")
     predictor.read_data()
     predictor.remove_nan()
     predictor.set_columns()
-    predictor.adjust_data()
     predictor.split_data()
     predictor.preprocess_data()
-    predictor.train_model()
+    predictor.train_model(2)
     predictor.generate_future_data()
     predictor.predict_future_data()
     predictor.plot_comparison()
-
