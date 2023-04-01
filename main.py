@@ -16,15 +16,16 @@ from tensorflow.keras.optimizers import Adam
 class RNNModel:
 	def __init__(self, input_file):
 		self.input_file = input_file
+		self.inicial = True
+		# Crea un objeto study de Optuna
+		self.study = optuna.create_study(direction="minimize")
 		# Define el diccionario de rangos de hiperparámetros
 		self.hyperparameter_ranges = {
 			"n_layers": (10, 30),
-			"num_units_layer": (10, 100),
+			"num_units_layer": (25, 100),
 			"lr": (1e-5, 1e-2),
-			"n_epochs": (10, 200),
-			"weights": (0.1, 1.0),
-			"dropout_rate": (0.0, 0.5),
-			"recurrent_dropout_rate": (0.0, 0.5)
+			"n_epochs": (100, 200),
+			"weights": (0.1, 1.0)
 		}
 	
 	def read_data(self):
@@ -81,10 +82,9 @@ class RNNModel:
 		if pretrained_model is not None:
 			self.load_pretrained_model(pretrained_model)
 		else:
-			study = optuna.create_study(direction="minimize")
-			study.optimize(self.objective, n_trials=n_trials)
+			self.study.optimize(self.objective, n_trials=n_trials)
 			
-			best_params = study.best_params
+			best_params = self.study.best_params
 			self.model = self.create_model(params=best_params)
 		
 		# Extraiga los mejores pesos de los parámetros
@@ -129,17 +129,61 @@ class RNNModel:
 		y_pred = K.cast(y_pred, 'float32')
 		return K.mean(K.square(y_true - y_pred) * K.constant(weights), axis=-1)
 	
+	# def objective(self, trial):
+	#
+	# 	try:
+	# 		model = self.create_model(trial)
+	#
+	# 		# Usa los rangos definidos en el diccionario de hiperparámetros
+	# 		n_epochs = trial.suggest_int("n_epochs", *self.hyperparameter_ranges["n_epochs"])
+	#
+	# 		# Sugiere un conjunto de pesos para las columnas numéricas
+	# 		weights = [trial.suggest_float(f"weight_{i + 1}", *self.hyperparameter_ranges["weights"]) for i in
+	# 				   range(len(self.num_features))]
+	#
+	# 		# Modificar la función de pérdida para utilizar los pesos
+	# 		model.compile(optimizer=model.optimizer,
+	# 					  loss=lambda y_true, y_pred: self.weighted_mse(y_true, y_pred, weights))
+	#
+	# 		early_stop = EarlyStopping(monitor='val_loss', patience=5)
+	# 		history = model.fit(
+	# 			self.X_train_transformed.reshape(-1, self.X_train_transformed.shape[1], 1),
+	# 			self.y_train,
+	# 			epochs=n_epochs,
+	# 			verbose=0,
+	# 			batch_size=75,
+	# 			validation_data=(self.X_test_transformed.reshape(-1, self.X_test_transformed.shape[1], 1), self.y_test),
+	# 			callbacks=[early_stop],
+	# 		)
+	# 	except Exception as e:
+	# 		print(f"Ocurrió un error durante el entrenamiento: {e}")
+	# 		return float(
+	# 			'inf')  # Retorna un valor de pérdida alto para que este intento no sea considerado como el mejor.
+	# 	return history.history["val_loss"][-1]
+	
 	def objective(self, trial):
 		
 		try:
+			# Crea un nuevo modelo en cada iteración del trial
 			model = self.create_model(trial)
 			
-			# Usa los rangos definidos en el diccionario de hiperparámetros
-			n_epochs = trial.suggest_int("n_epochs", *self.hyperparameter_ranges["n_epochs"])
-			
-			# Sugiere un conjunto de pesos para las columnas numéricas
-			weights = [trial.suggest_float(f"weight_{i + 1}", *self.hyperparameter_ranges["weights"]) for i in
-					   range(len(self.num_features))]
+			# Si es la primera iteración del trial, utiliza los rangos definidos en el diccionario de hiperparámetros
+			if trial.number == 0:
+				n_epochs = trial.suggest_int("n_epochs", *self.hyperparameter_ranges["n_epochs"])
+				weights = [trial.suggest_float(f"weight_{i + 1}", *self.hyperparameter_ranges["weights"]) for i in
+						   range(len(self.num_features))]
+			else:
+				# Si no es la primera iteración, utiliza los pesos del best_model
+				if self.inicial is False:
+					best_weights = self.study.best_trial.user_attrs['best_weights']
+					weights = [best_weights[f"weight_{i + 1}"] for i in range(len(self.num_features))]
+					n_epochs = self.study.best_trial.user_attrs['best_n_epochs']
+				else:
+					# Si aún no hay un best_trial, utiliza los rangos definidos en el diccionario de hiperparámetros
+					self.inicial = False
+					n_epochs = trial.suggest_int("n_epochs", *self.hyperparameter_ranges["n_epochs"])
+					weights = [trial.suggest_float(f"weight_{i + 1}", *self.hyperparameter_ranges["weights"]) for i in
+							   range(len(self.num_features))]
 			
 			# Modificar la función de pérdida para utilizar los pesos
 			model.compile(optimizer=model.optimizer,
@@ -155,26 +199,23 @@ class RNNModel:
 				validation_data=(self.X_test_transformed.reshape(-1, self.X_test_transformed.shape[1], 1), self.y_test),
 				callbacks=[early_stop],
 			)
+			
+			# Guarda los pesos y epochs utilizados en este intento como user_attrs del trial
+			trial.set_user_attr('best_weights', {f"weight_{i + 1}": weights[i] for i in range(len(self.num_features))})
+			trial.set_user_attr('best_n_epochs', n_epochs)
+		
 		except Exception as e:
 			print(f"Ocurrió un error durante el entrenamiento: {e}")
-			return float(
-				'inf')  # Retorna un valor de pérdida alto para que este intento no sea considerado como el mejor.
+			return float('inf')
+		
+		# Retorna la pérdida en el conjunto de validación del último epoch
 		return history.history["val_loss"][-1]
 	
 	def create_model(self, trial=None, params=None):
-		
 		if trial is not None:
 			n_layers = trial.suggest_int("n_layers", *self.hyperparameter_ranges["n_layers"])
 		else:
 			n_layers = params["n_layers"]
-		
-		if trial is not None:
-			dropout_rate = trial.suggest_float("dropout_rate", *self.hyperparameter_ranges["dropout_rate"])
-			recurrent_dropout_rate = trial.suggest_float("recurrent_dropout_rate",
-														 *self.hyperparameter_ranges["recurrent_dropout_rate"])
-		else:
-			dropout_rate = params["dropout_rate"]
-			recurrent_dropout_rate = params["recurrent_dropout_rate"]
 		
 		model = Sequential()
 		for i in range(n_layers):
@@ -186,14 +227,12 @@ class RNNModel:
 			
 			if i == 0:
 				model.add(LSTM(num_units, activation='relu', input_shape=(self.X_train_transformed.shape[1], 1),
-							   return_sequences=True if n_layers > 1 else False, dropout=dropout_rate,
-							   recurrent_dropout=recurrent_dropout_rate))
+							   return_sequences=True if n_layers > 1 else False))
 			elif i < n_layers - 1:
-				model.add(LSTM(num_units, activation='relu', return_sequences=True, dropout=dropout_rate,
-							   recurrent_dropout=recurrent_dropout_rate))
+				model.add(LSTM(num_units, activation='relu', return_sequences=True))
 			else:
-				model.add(
-					LSTM(num_units, activation='relu', dropout=dropout_rate, recurrent_dropout=recurrent_dropout_rate))
+				model.add(LSTM(num_units, activation='relu'))
+		
 		model.add(Dense(len(self.num_features)))
 		model.add(Dense(len(self.num_features)))
 		
@@ -202,6 +241,7 @@ class RNNModel:
 		else:
 			lr = params["lr"]
 		
+		model.compile(optimizer=Adam(learning_rate=lr), loss='mse')
 		model.compile(optimizer=Adam(learning_rate=lr), loss=self.weighted_mse)
 		return model
 	
@@ -295,7 +335,7 @@ if __name__ == '__main__':
 	predictor.set_columns()
 	predictor.split_data()
 	predictor.preprocess_data()
-	predictor.train_model(2)
+	predictor.train_model(600)
 	predictor.generate_future_data()
 	predictor.predict_future_data()
 	predictor.plot_comparison()
